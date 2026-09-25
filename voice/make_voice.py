@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Subtitles -> narration in the BUDA-CAT reference voice style.
 
-Voice = Kokoro-82M stock voice -> pitch/formant shift + wider intonation (Praat)
--> match-EQ towards the reference. Settings live in a profile JSON (profiles/).
+Engines (picked by the profile JSON in profiles/):
+  chatterbox - zero-shot clone of the reference narrator (default, profiles/clone_narrator.json)
+  kokoro     - Kokoro-82M stock voice coloured towards the reference (A/B/C profiles, offline)
+Both then get a pitch/formant move (Praat) and optional match-EQ.
 
   python3 make_voice.py subs.srt                       # -> out/subs.wav + .mp3
   python3 make_voice.py subs.srt --video short.mp4     # also muxes out/short_voiced.mp4
@@ -113,7 +115,29 @@ def apply_eq(a, gains_db, taps=1025):
 
 # ---------- synthesis ----------
 
-class Voice:
+def color(a, p):
+    """Apply the profile's pitch/formant move and match-EQ to raw TTS audio."""
+    target = p.get("pitch_median_hz")
+    if target:
+        strength = p.get("pitch_normalize", 1.0)
+        pitch = p.get("pitch_median_hz")
+        if strength < 1.0:  # pull each line only part of the way to the target
+            f0 = parselmouth.Sound(np.asarray(a, dtype=np.float64), SR).to_pitch_ac(0.01, 75, 650)
+            v = f0.selected_array["frequency"]
+            v = v[v > 0]
+            if v.size:
+                m = float(np.median(v))
+                pitch = m * (target / m) ** strength
+        a = shift_voice(a, p.get("formant_shift", 1.0), pitch, p.get("expressiveness", 1.0))
+    if p.get("eq_gains_db"):
+        a = apply_eq(a, p["eq_gains_db"])
+    return a
+
+
+class KokoroVoice:
+    """Kokoro-82M stock voice (optionally a blend), coloured towards the reference."""
+    resynth = True  # can re-synthesize faster when a line doesn't fit
+
     def __init__(self, profile):
         from kokoro_onnx import Kokoro
         self.p = profile
@@ -127,15 +151,46 @@ class Voice:
         assert sr == SR
         return a
 
-    def color(self, a):
-        p = self.p
-        a = shift_voice(a, p["formant_shift"], p["pitch_median_hz"], p["expressiveness"])
-        if p.get("eq_gains_db"):
-            a = apply_eq(a, p["eq_gains_db"])
-        return a
-
     def say(self, text, speed=None):
-        return trim(self.color(self.raw(text, speed or self.p["speed"])))
+        return trim(color(self.raw(text, speed or self.p["speed"]), self.p))
+
+    def synth_all(self, texts):
+        return [self.say(t) for t in texts]
+
+
+class CloneVoice:
+    """Zero-shot clone of the reference narrator with Chatterbox (runs in cb_venv)."""
+    resynth = False
+
+    def __init__(self, profile):
+        self.p = profile
+        self.python = os.path.join(HERE, "cb_venv", "bin", "python")
+        if not os.path.exists(self.python):
+            sys.exit("cb_venv missing - run ./setup.sh first")
+
+    def synth_all(self, texts):
+        p = self.p
+        with tempfile.TemporaryDirectory() as d:
+            job = {"ref": os.path.join(HERE, p["ref_audio"]), "exaggeration": p["exaggeration"],
+                   "cfg_weight": p["cfg_weight"], "seed": p.get("seed", 7),
+                   "max_tries": p.get("max_tries", 3), "max_wer": p.get("max_wer", 0.1), "out_dir": d,
+                   "items": [{"id": str(i), "text": t} for i, t in enumerate(texts)]}
+            jp = os.path.join(d, "job.json")
+            with open(jp, "w") as f:
+                json.dump(job, f)
+            subprocess.run([self.python, os.path.join(HERE, "cb_worker.py"), jp], check=True)
+            out = []
+            for r in json.load(open(os.path.join(d, "results.json"))):
+                a, sr = sf.read(r["path"], dtype="float32")
+                assert sr == SR, sr
+                if r["wer"] > p.get("max_wer", 0.1):
+                    print(f"  ! line {r['id']} still differs after retries: heard {r['heard']!r}", flush=True)
+                out.append(trim(color(a, p)))
+        return out
+
+
+def make_voice(profile):
+    return CloneVoice(profile) if profile.get("engine") == "chatterbox" else KokoroVoice(profile)
 
 
 def trim(a, thresh_db=-45, pad=0.03):
@@ -149,24 +204,31 @@ def trim(a, thresh_db=-45, pad=0.03):
     return a[s:e]
 
 
-def atempo(a, factor):
+def stretch(a, factor):
+    """Speed speech up by `factor` without changing pitch (Rubber Band, else atempo)."""
     if abs(factor - 1) < 0.01:
         return a
     with tempfile.TemporaryDirectory() as d:
         i, o = os.path.join(d, "i.wav"), os.path.join(d, "o.wav")
         sf.write(i, a, SR)
-        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", i, "-filter:a",
-                        f"atempo={factor:.4f}", o], check=True)
+        for filt in (f"rubberband=tempo={factor:.4f}", f"atempo={factor:.4f}"):
+            r = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", i, "-filter:a", filt, o])
+            if r.returncode == 0:
+                break
+        else:
+            raise RuntimeError("ffmpeg time-stretch failed")
         b, _ = sf.read(o, dtype="float32")
     return b
 
 
-def fit(voice, text, slot):
-    """Synthesize text so it fits in `slot` seconds (None = no limit)."""
-    base = voice.p["speed"]
-    a = voice.say(text, base)
+def fit(voice, text, slot, a):
+    """Make pre-synthesized line `a` fit in `slot` seconds (None = no limit)."""
     if slot is None or len(a) / SR <= slot:
         return a, 1.0
+    if not voice.resynth:
+        extra = min(len(a) / SR / slot, MAX_SPEEDUP * 1.1)
+        return stretch(a, extra), extra
+    base = voice.p["speed"]
     need = len(a) / SR / slot
     # re-synthesize faster first (sounds more natural than stretching)
     sp = min(base * need * 1.02, base * MAX_SPEEDUP)
@@ -177,7 +239,7 @@ def fit(voice, text, slot):
         # Kokoro's speed isn't exactly linear; close the gap by stretching,
         # allowing ~10% past the cap before giving up and overflowing
         extra = min(rest, MAX_SPEEDUP / ratio * 1.1)
-        a = atempo(a, extra)
+        a = stretch(a, extra)
         ratio *= extra
     return a, ratio
 
@@ -187,6 +249,7 @@ def render(items, voice, gap):
     timed = items and items[0][0] is not None
     out = np.zeros(int(SR * ((items[-1][1] + 2) if timed else 1)), np.float32)
     report, cursor = [], 0.0
+    lines = voice.synth_all([t for _, _, t in items])
     for n, (s, e, text) in enumerate(items):
         if timed:
             nxt = items[n + 1][0] if n + 1 < len(items) else None
@@ -195,7 +258,7 @@ def render(items, voice, gap):
             start = max(s, cursor)
         else:
             slot, start = None, cursor
-        a, ratio = fit(voice, text, slot)
+        a, ratio = fit(voice, text, slot, lines[n])
         i = int(start * SR)
         if i + len(a) > len(out):
             out = np.concatenate([out, np.zeros(i + len(a) - len(out) + SR, np.float32)])
@@ -227,7 +290,7 @@ def main():
     ap.add_argument("--video", help="mux the narration into this video")
     ap.add_argument("--keep-original", type=float, default=0.0,
                     help="volume of the video's original audio under the voice (0 = drop it)")
-    ap.add_argument("--profile", default=os.path.join(HERE, "profiles", "A_river.json"))
+    ap.add_argument("--profile", default=os.path.join(HERE, "profiles", "clone_narrator.json"))
     ap.add_argument("--out", default=os.path.join(HERE, "out"))
     ap.add_argument("--name")
     ap.add_argument("--no-group", action="store_true", help="speak each subtitle cue separately")
@@ -236,7 +299,7 @@ def main():
         ap.error("give a subtitle file or --text")
 
     prof = load_profile(args.profile)
-    voice = Voice(prof)
+    voice = make_voice(prof)
     if args.text:
         items = [(None, None, t.strip()) for t in re.split(r"(?<=[.!?])\s+", args.text) if t.strip()]
         name = args.name or "preview"

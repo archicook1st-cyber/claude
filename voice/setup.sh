@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installs everything make_voice.py needs and fetches the Kokoro-82M model + voices.
+# Installs everything make_voice.py needs: the Chatterbox clone engine (cb_venv)
+# and the offline Kokoro-82M model + voices.
 # The model files come from the `expo-kokoro` npm tarball (onnx + voice .bin files);
 # only those data files are extracted, none of the package's JS is run.
 set -euo pipefail
@@ -29,5 +30,12 @@ np.savez(dst, **voices)
 print(f"{len(voices)} voices -> {dst}")
 EOF
   rm -rf "$tmp"
+fi
+# Voice-clone engine (Chatterbox, MIT) in its own venv: it pins torch 2.6.
+# Its weights download from huggingface.co on first use, so the environment's
+# network allowlist needs huggingface.co and *.hf.co.
+if [ ! -x cb_venv/bin/python ]; then
+  python3 -m venv cb_venv
+  cb_venv/bin/pip install -q chatterbox-tts faster-whisper
 fi
 echo "setup ok"

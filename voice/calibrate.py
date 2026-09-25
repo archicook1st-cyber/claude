@@ -8,7 +8,7 @@ Similarity uses Resemblyzer if it is installed (pip install torch; pip install -
 """
 import argparse, json, os, subprocess, tempfile
 import numpy as np, soundfile as sf, parselmouth
-from make_voice import SR, Voice, shift_voice, eq_curve, apply_eq, band_db
+from make_voice import SR, KokoroVoice, shift_voice, eq_curve, apply_eq, band_db
 
 CALIBRATION_TEXT = (
     "I was just riding along, heading out from my home, when a motorbike came flying at me the wrong way! "
@@ -62,7 +62,9 @@ def main():
     ref = load_ref(args.reference, skips)
     prof = json.load(open(args.profile))
     prof.pop("eq_gains_db", None)
-    v = Voice(prof)
+    if prof.get("engine") == "chatterbox":
+        raise SystemExit("calibrate.py tunes Kokoro profiles; the clone profile takes its timbre from ref_audio")
+    v = KokoroVoice(prof)
     raw = v.raw(CALIBRATION_TEXT, prof["speed"])
     shifted = shift_voice(raw, prof["formant_shift"], prof["pitch_median_hz"], prof["expressiveness"])
     gains = eq_curve(shifted, ref)
