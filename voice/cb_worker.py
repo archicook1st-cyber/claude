@@ -26,6 +26,27 @@ def words(s):
     return [w for w in ws if w not in NUMBERISH and not any(c.isdigit() for c in w)]
 
 
+def trim_tail(path, text, asr):
+    """Cut sounds the model tacked on after the final word (e.g. a stray "WHAA-").
+    Returns what Whisper heard, up to the cut. Only trims when the final word is clearly found."""
+    segs, _ = asr.transcribe(path, language="en", word_timestamps=True)
+    ws = [w for s in segs for w in s.words]
+    raw = lambda s: re.findall(r"[a-z0-9']+", s.lower().replace("’", "'"))
+    last = (raw(text) or [""])[-1]
+    idx = max((i for i, w in enumerate(ws) if last in raw(w.word)), default=None)
+    if idx is None or idx == len(ws) - 1:
+        return " ".join(w.word.strip() for w in ws)
+    wav, sr = torchaudio.load(path)
+    cut = min(wav.shape[-1], int((ws[idx].end + 0.12) * sr))
+    fade = torch.linspace(1, 0, min(int(0.03 * sr), cut))
+    wav = wav[..., :cut].clone()
+    wav[..., cut - fade.numel():] *= fade
+    torchaudio.save(path, wav, sr)
+    extra = " ".join(w.word.strip() for w in ws[idx + 1:])
+    print(f"    trimmed trailing {extra!r} after {ws[idx].end:.2f}s", flush=True)
+    return " ".join(w.word.strip() for w in ws[:idx + 1])
+
+
 def wer(ref, hyp):
     r, h = words(ref), words(hyp)
     if not r:
@@ -54,7 +75,7 @@ def main():
                                  exaggeration=job["exaggeration"], cfg_weight=job["cfg_weight"])
             path = os.path.join(job["out_dir"], f"{it['id']}_try{attempt}.wav")
             torchaudio.save(path, wav, model.sr)
-            heard = " ".join(s.text.strip() for s in asr.transcribe(path, language="en")[0])
+            heard = trim_tail(path, it["text"], asr)
             err = wer(it["text"], heard)
             print(f"[{it['id']}] try {attempt}: {wav.shape[-1] / model.sr:.1f}s in {time.time() - t:.0f}s, "
                   f"WER {err:.2f} | {heard}", flush=True)

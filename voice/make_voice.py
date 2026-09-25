@@ -339,9 +339,9 @@ def render(items, voice, gap, duration=None):
     pause = voice.p.get("sentence_pause", 0.25)
     sents = [split_sentences(normalize_for_tts(t)) for _, _, t in items]
     flat = voice.synth_all([s for ss in sents for s in ss])
-    lines, k = [], 0
+    parts, k = [], 0
     for ss in sents:
-        lines.append(join_sentences(flat[k:k + len(ss)], ss, pause))
+        parts.append(flat[k:k + len(ss)])
         k += len(ss)
     for n, (s, e, text) in enumerate(items):
         if timed:
@@ -349,13 +349,19 @@ def render(items, voice, gap, duration=None):
             if nxt is not None:
                 slot = max(nxt - s - gap, e - s)
             elif duration:  # last line must finish before the video ends
-                slot = duration - s - 0.25
+                slot = duration - s - 0.1
             else:
                 slot = max(e - s, 0.1) + 1.5
             start = max(s, cursor)
         else:
             slot, start = None, cursor
-        a, ratio = fit(voice, " ".join(sents[n]), slot, lines[n])
+        line = join_sentences(parts[n], sents[n], pause)
+        if slot and len(line) / SR > slot and len(parts[n]) > 1:
+            # tighten the pauses between sentences before speeding the voice up
+            weight = sum(1.6 if x.endswith("...") else 1.0 for x in sents[n][:-1])
+            tight = max(0.1, pause - (len(line) / SR - slot) / weight)
+            line = join_sentences(parts[n], sents[n], tight)
+        a, ratio = fit(voice, " ".join(sents[n]), slot, line)
         i = int(start * SR)
         if i + len(a) > len(out):
             out = np.concatenate([out, np.zeros(i + len(a) - len(out) + SR, np.float32)])
