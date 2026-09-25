@@ -46,13 +46,22 @@
 ```bash
 ./setup.sh                                  # 최초 1회: ffmpeg, 복제 엔진(cb_venv), Kokoro 모델 설치
 python3 make_voice.py subs.srt              # -> out/subs.wav, out/subs.mp3
-python3 make_voice.py subs.srt --video short.mp4                      # 원본 오디오를 빼고 내레이션만 입힘
-python3 make_voice.py subs.srt --video short.mp4 --keep-original 0.2  # 원본 오디오를 20% 볼륨으로 깔기
+python3 make_voice.py subs.srt --video short.mp4   # 영상 길이에 맞춘 목소리 + (목소리+배경음악) 믹스 + 미리보기 mp4
+python3 make_voice.py subs.srt --video short.mp4 --bgm-volume 0.6   # 믹스에서 배경음악을 60%로
 python3 make_voice.py subs.srt --profile profiles/C_sarah.json        # Kokoro 목소리 사용(오프라인, 빠름)
 python3 make_voice.py --text "Wait, did he just say yes?"             # 빠른 미리듣기
 ```
 
-- 잘게 쪼개진 자막은 문장 부호(. ! ?) 기준으로 합쳐서 읽기 때문에 억양이 자연스럽습니다. 자막 한 줄씩 따로 읽히려면 `--no-group`을 붙이세요.
+- 잘게 쪼개진 자막은 문장 부호(. ! ?) 기준으로 합쳐 문장 단위로 만듭니다. 그래서 억양이 자연스럽습니다. 자막 한 줄씩 따로 읽히려면 `--no-group`을 붙이세요.
+  "Huh?"처럼 아주 짧은 문장은 다음 문장에 붙여서 만듭니다.
+- `$1.50` → "a dollar fifty", `3` → "three", `~` → `!`, `ALWAYS` → "always"처럼 숫자와 기호는 읽기 좋게 바꿔서 합성합니다.
+- `--video`를 주면 영상과 길이가 정확히 같은 파일이 세 가지 나옵니다.
+  - `*_voice.wav/mp3`: 목소리만
+  - `*_voice+bgm.wav/mp3`: 영상의 원래 오디오(배경음악)와 목소리를 섞은 것
+  - `*_preview.mp4`: 싱크 확인용 미리보기
+
+  YouTube 다국어 오디오 트랙은 원래 오디오를 통째로 바꾸기 때문에, 배경음악이 있는 영상이면 `*_voice+bgm` 파일을 올리세요.
+- 복제 음성은 문장별로 `.cache/`에 저장됩니다. 자막 일부만 고쳐서 다시 돌리면 바뀐 문장만 새로 만듭니다.
 - 문장은 해당 자막 시작 시각에 배치됩니다. 다음 자막 전까지 다 못 읽으면 음높이는 그대로 두고 최대 약 1.5배까지 빠르게 만듭니다(Rubber Band). 그래도 넘치면 `OVERFLOW`로 알려줍니다.
 - 출력은 −16 LUFS, 트루피크 −1.5 dBTP로 맞춰집니다(`target_lufs`로 조정).
 - Kokoro 프로필의 EQ를 새 레퍼런스에 맞춰 다시 계산하려면

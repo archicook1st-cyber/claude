@@ -8,15 +8,22 @@ job.json: {"ref": "refs/narrator.wav", "exaggeration": 0.7, "cfg_weight": 0.4, "
 Each line is checked with Whisper and regenerated with a new seed when words go missing.
 Writes <out_dir>/<id>.wav and <out_dir>/results.json.
 """
-import json, os, re, sys, time, difflib, warnings
+import json, os, re, sys, time, difflib, warnings, zlib
 warnings.filterwarnings("ignore")
 import torch, torchaudio
 
 torch.set_num_threads(os.cpu_count() or 4)
 
 
+# Whisper may write "$1.50" where we said "a dollar fifty"; don't count number wording as errors
+NUMBERISH = set(("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+                 "sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety "
+                 "hundred thousand dollar dollars cent cents point a").split())
+
+
 def words(s):
-    return re.findall(r"[a-z0-9']+", s.lower().replace("’", "'"))
+    ws = re.findall(r"[a-z0-9']+", s.lower().replace("’", "'").replace("-", " "))
+    return [w for w in ws if w not in NUMBERISH and not any(c.isdigit() for c in w)]
 
 
 def wer(ref, hyp):
@@ -41,7 +48,7 @@ def main():
     for it in job["items"]:
         best = None
         for attempt in range(job.get("max_tries", 3)):
-            torch.manual_seed(job.get("seed", 7) + attempt * 1000 + int(it["id"]))
+            torch.manual_seed(job.get("seed", 7) + attempt * 1000 + zlib.crc32(it["text"].encode()) % 100000)
             t = time.time()
             wav = model.generate(it["text"], audio_prompt_path=job["ref"],
                                  exaggeration=job["exaggeration"], cfg_weight=job["cfg_weight"])

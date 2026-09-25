@@ -7,10 +7,10 @@ Engines (picked by the profile JSON in profiles/):
 Both then get a pitch/formant move (Praat) and optional match-EQ.
 
   python3 make_voice.py subs.srt                       # -> out/subs.wav + .mp3
-  python3 make_voice.py subs.srt --video short.mp4     # also muxes out/short_voiced.mp4
+  python3 make_voice.py subs.srt --video short.mp4     # -> out/subs_voice.*, subs_voice+bgm.*, subs_preview.mp4
   python3 make_voice.py --text "Wait, did he just say yes?"   # quick preview
 """
-import argparse, json, os, re, subprocess, sys, tempfile
+import argparse, hashlib, json, os, re, subprocess, sys, tempfile
 import numpy as np, soundfile as sf, parselmouth
 from parselmouth.praat import call
 
@@ -66,6 +66,67 @@ def group_sentences(cues):
     out = []
     for g in groups:
         out.append((g[0][0], g[-1][1], " ".join(c[2] for c in g)))
+    return out
+
+
+# ---------- text prep ----------
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+         "fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def num_words(n):
+    n = int(n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("" if n % 10 == 0 else "-" + _ONES[n % 10])
+    if n < 1000:
+        return _ONES[n // 100] + " hundred" + ("" if n % 100 == 0 else " " + num_words(n % 100))
+    if n < 1_000_000:
+        return num_words(n // 1000) + " thousand" + ("" if n % 1000 == 0 else " " + num_words(n % 1000))
+    return str(n)
+
+
+def _money(m):
+    d, c = int(m.group(1).replace(",", "")), int(m.group(2) or 0)
+    if d == 1 and c:
+        return "a dollar " + num_words(c)  # $1.50 -> a dollar fifty
+    dollars = f"{num_words(d)} dollar{'' if d == 1 else 's'}"
+    return f"{dollars} {num_words(c)}" if c else dollars
+
+
+def normalize_for_tts(text):
+    """Spell out money/numbers and drop symbols the TTS would stumble on."""
+    t = text.replace("’", "'").replace("‘", "'")
+    t = re.sub(r"\$(\d[\d,]*)(?:\.(\d\d))?\b", _money, t)
+    t = re.sub(r"\b\d{1,6}\b", lambda m: num_words(m.group()), t)
+    t = re.sub(r"[\"“”]", "", t)
+    t = t.replace("~", "!").replace("…", "...")
+    t = re.sub(r"\b[A-Z]{2,}\b", lambda m: m.group() if m.group() in ("OK", "ID", "VIP") else m.group().lower(), t)
+    t = re.sub(r"\s+", " ", t).strip()
+    # capitalize after . ! ? (but not after "..." which reads as a trailing-off continuation)
+    t = re.sub(r"(?<!\.)([.!?])(\s+)([a-z])", lambda m: m.group(1) + m.group(2) + m.group(3).upper(), t)
+    return t[:1].upper() + t[1:]
+
+
+def split_sentences(text, min_words=4):
+    """Split a cue into sentences; very short ones ("Huh?") ride along with the next."""
+    parts = [p for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    out, carry = [], ""
+    for p in parts:
+        cur = (carry + " " + p).strip() if carry else p
+        if len(cur.split()) < min_words:
+            carry = cur
+        else:
+            out.append(cur[:1].upper() + cur[1:])
+            carry = ""
+    if carry:
+        if out:
+            out[-1] += " " + carry
+        else:
+            out.append(carry[:1].upper() + carry[1:])
     return out
 
 
@@ -168,24 +229,40 @@ class CloneVoice:
         if not os.path.exists(self.python):
             sys.exit("cb_venv missing - run ./setup.sh first")
 
+    def _key(self, text):
+        p, ref = self.p, os.path.join(HERE, self.p["ref_audio"])
+        with open(ref, "rb") as f:
+            ref_hash = hashlib.sha1(f.read()).hexdigest()
+        parts = [text, ref_hash, p["exaggeration"], p["cfg_weight"], p.get("seed", 7)]
+        return hashlib.sha1(json.dumps(parts).encode()).hexdigest()[:16]
+
     def synth_all(self, texts):
+        """Raw clone audio is cached per line, so re-runs only generate what changed."""
         p = self.p
-        with tempfile.TemporaryDirectory() as d:
-            job = {"ref": os.path.join(HERE, p["ref_audio"]), "exaggeration": p["exaggeration"],
-                   "cfg_weight": p["cfg_weight"], "seed": p.get("seed", 7),
-                   "max_tries": p.get("max_tries", 3), "max_wer": p.get("max_wer", 0.1), "out_dir": d,
-                   "items": [{"id": str(i), "text": t} for i, t in enumerate(texts)]}
-            jp = os.path.join(d, "job.json")
-            with open(jp, "w") as f:
-                json.dump(job, f)
-            subprocess.run([self.python, os.path.join(HERE, "cb_worker.py"), jp], check=True)
-            out = []
-            for r in json.load(open(os.path.join(d, "results.json"))):
-                a, sr = sf.read(r["path"], dtype="float32")
-                assert sr == SR, sr
-                if r["wer"] > p.get("max_wer", 0.1):
-                    print(f"  ! line {r['id']} still differs after retries: heard {r['heard']!r}", flush=True)
-                out.append(trim(color(a, p)))
+        cache = os.path.join(HERE, ".cache", "clone")
+        os.makedirs(cache, exist_ok=True)
+        keys = [self._key(t) for t in texts]
+        todo = {k: t for k, t in zip(keys, texts) if not os.path.exists(os.path.join(cache, k + ".wav"))}
+        print(f"{len(texts) - len(todo)} of {len(texts)} lines cached, generating {len(todo)}", flush=True)
+        if todo:
+            with tempfile.TemporaryDirectory() as d:
+                job = {"ref": os.path.join(HERE, p["ref_audio"]), "exaggeration": p["exaggeration"],
+                       "cfg_weight": p["cfg_weight"], "seed": p.get("seed", 7),
+                       "max_tries": p.get("max_tries", 3), "max_wer": p.get("max_wer", 0.1), "out_dir": d,
+                       "items": [{"id": k, "text": t} for k, t in todo.items()]}
+                jp = os.path.join(d, "job.json")
+                with open(jp, "w") as f:
+                    json.dump(job, f)
+                subprocess.run([self.python, os.path.join(HERE, "cb_worker.py"), jp], check=True)
+                for r in json.load(open(os.path.join(d, "results.json"))):
+                    if r["wer"] > p.get("max_wer", 0.1):
+                        print(f"  ! still differs after retries: {r['text']!r} -> heard {r['heard']!r}", flush=True)
+                    os.replace(r["path"], os.path.join(cache, r["id"] + ".wav"))
+        out = []
+        for k in keys:
+            a, sr = sf.read(os.path.join(cache, k + ".wav"), dtype="float32")
+            assert sr == SR, sr
+            out.append(trim(color(a, p)))
         return out
 
 
@@ -244,21 +321,41 @@ def fit(voice, text, slot, a):
     return a, ratio
 
 
-def render(items, voice, gap):
-    """items: [(start, end, text)] -> (audio, report)"""
+def join_sentences(parts, sentences, pause):
+    """Concatenate one cue's sentences with a natural pause (longer after '...')."""
+    out = []
+    for i, (a, s) in enumerate(zip(parts, sentences)):
+        out.append(a)
+        if i < len(parts) - 1:
+            out.append(np.zeros(int(SR * (pause * 1.6 if s.endswith("...") else pause)), np.float32))
+    return np.concatenate(out)
+
+
+def render(items, voice, gap, duration=None):
+    """items: [(start, end, text)] -> (audio, report). `duration` caps the timeline (e.g. video length)."""
     timed = items and items[0][0] is not None
     out = np.zeros(int(SR * ((items[-1][1] + 2) if timed else 1)), np.float32)
     report, cursor = [], 0.0
-    lines = voice.synth_all([t for _, _, t in items])
+    pause = voice.p.get("sentence_pause", 0.25)
+    sents = [split_sentences(normalize_for_tts(t)) for _, _, t in items]
+    flat = voice.synth_all([s for ss in sents for s in ss])
+    lines, k = [], 0
+    for ss in sents:
+        lines.append(join_sentences(flat[k:k + len(ss)], ss, pause))
+        k += len(ss)
     for n, (s, e, text) in enumerate(items):
         if timed:
             nxt = items[n + 1][0] if n + 1 < len(items) else None
-            slot = (nxt - s - gap) if nxt is not None else max(e - s, 0.1) + 1.5
-            slot = max(slot, e - s)
+            if nxt is not None:
+                slot = max(nxt - s - gap, e - s)
+            elif duration:  # last line must finish before the video ends
+                slot = duration - s - 0.25
+            else:
+                slot = max(e - s, 0.1) + 1.5
             start = max(s, cursor)
         else:
             slot, start = None, cursor
-        a, ratio = fit(voice, text, slot, lines[n])
+        a, ratio = fit(voice, " ".join(sents[n]), slot, lines[n])
         i = int(start * SR)
         if i + len(a) > len(out):
             out = np.concatenate([out, np.zeros(i + len(a) - len(out) + SR, np.float32)])
@@ -271,25 +368,49 @@ def render(items, voice, gap):
     end = int((cursor + 0.3) * SR)
     if timed:
         end = max(end, int((items[-1][1] + 0.3) * SR))
+    if duration:
+        end = int(duration * SR)
+        out = np.concatenate([out, np.zeros(max(0, end - len(out)), np.float32)])
     return out[:end], report
 
 
-def master(a, lufs, path):
-    """Loudness-normalize with a true-peak limit and write a 48 kHz WAV."""
+def master(a, lufs, path, duration=None):
+    """Loudness-normalize with a true-peak limit and write a 48 kHz WAV (exactly `duration` s if given)."""
+    af = f"loudnorm=I={lufs}:TP=-1.5:LRA=11,aresample=48000"
+    if duration:
+        af += f",apad,atrim=0:{duration:.3f}"
     with tempfile.TemporaryDirectory() as d:
         i = os.path.join(d, "i.wav")
         sf.write(i, a, SR)
-        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", i, "-af",
-                        f"loudnorm=I={lufs}:TP=-1.5:LRA=11", "-ar", "48000", path], check=True)
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", i, "-af", af, "-ar", "48000", path],
+                       check=True)
+
+
+def media_duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                       capture_output=True, text=True, check=True)
+    return float(r.stdout.strip())
+
+
+def has_audio(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                        "-of", "csv=p=0", path], capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+def to_mp3(wav):
+    mp3 = wav[:-4] + ".mp3"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", wav, "-b:a", "192k", mp3], check=True)
+    return mp3
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("subs", nargs="?", help=".srt / .vtt / .txt (one sentence per line)")
     ap.add_argument("--text", help="speak this text instead of a subtitle file")
-    ap.add_argument("--video", help="mux the narration into this video")
-    ap.add_argument("--keep-original", type=float, default=0.0,
-                    help="volume of the video's original audio under the voice (0 = drop it)")
+    ap.add_argument("--video", help="match this video's length; also writes a voice+BGM mix and a preview mp4")
+    ap.add_argument("--bgm-volume", type=float, default=1.0,
+                    help="level of the video's own audio in the voice+BGM mix (0 = skip the mix)")
     ap.add_argument("--profile", default=os.path.join(HERE, "profiles", "clone_narrator.json"))
     ap.add_argument("--out", default=os.path.join(HERE, "out"))
     ap.add_argument("--name")
@@ -301,35 +422,37 @@ def main():
     prof = load_profile(args.profile)
     voice = make_voice(prof)
     if args.text:
-        items = [(None, None, t.strip()) for t in re.split(r"(?<=[.!?])\s+", args.text) if t.strip()]
+        items = [(None, None, args.text)]
         name = args.name or "preview"
     else:
         items = parse_subs(args.subs)
         if not args.no_group:
             items = group_sentences(items)
         name = args.name or os.path.splitext(os.path.basename(args.subs))[0]
+    duration = media_duration(args.video) if args.video else None
 
-    audio, report = render(items, voice, prof.get("min_gap", 0.08))
+    audio, report = render(items, voice, prof.get("min_gap", 0.08), duration)
     os.makedirs(args.out, exist_ok=True)
-    wav = os.path.join(args.out, name + ".wav")
-    master(audio, prof.get("target_lufs", -16), wav)
-    mp3 = wav[:-4] + ".mp3"
-    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", wav, "-ar", "44100",
-                    "-b:a", "192k", mp3], check=True)
-    print("->", wav, "\n->", mp3)
+    wav = os.path.join(args.out, name + ("_voice.wav" if args.video else ".wav"))
+    master(audio, prof.get("target_lufs", -16), wav, duration)
+    print("->", wav, "\n->", to_mp3(wav))
 
     if args.video:
-        vid_out = os.path.join(args.out, os.path.splitext(os.path.basename(args.video))[0] + "_voiced.mp4")
-        if args.keep_original > 0:
-            filt = (f"[0:a]volume={args.keep_original}[bg];[1:a]aresample=48000[v];"
-                    "[bg][v]amix=inputs=2:duration=first:normalize=0[a]")
-            cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", args.video, "-i", wav,
-                   "-filter_complex", filt, "-map", "0:v", "-map", "[a]"]
-        else:
-            cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", args.video, "-i", wav,
-                   "-map", "0:v", "-map", "1:a", "-af", "apad", "-shortest"]
-        subprocess.run(cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", vid_out], check=True)
-        print("->", vid_out)
+        track = wav
+        if args.bgm_volume > 0 and has_audio(args.video):
+            track = os.path.join(args.out, name + "_voice+bgm.wav")
+            filt = (f"[0:a]aresample=48000,volume={args.bgm_volume}[bg];"
+                    "[1:a]aresample=48000,pan=stereo|c0=c0|c1=c0[v];"
+                    "[bg][v]amix=inputs=2:duration=longest:normalize=0,"
+                    f"alimiter=limit=0.89:level=false,apad,atrim=0:{duration:.3f}[a]")
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", args.video, "-i", wav,
+                            "-filter_complex", filt, "-map", "[a]", "-ar", "48000", track], check=True)
+            print("->", track, "\n->", to_mp3(track))
+        preview = os.path.join(args.out, name + "_preview.mp4")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", args.video, "-i", track,
+                        "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-shortest", preview], check=True)
+        print("->", preview)
 
     overs = [r for r in report if r[3] > 0.05]
     if overs:

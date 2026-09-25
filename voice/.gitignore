@@ -2,3 +2,4 @@ models/
 out/
 __pycache__/
 cb_venv
+.cache/
