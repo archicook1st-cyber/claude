@@ -91,8 +91,8 @@ def num_words(n):
 
 def _money(m):
     d, c = int(m.group(1).replace(",", "")), int(m.group(2) or 0)
-    if d == 1 and c:
-        return "a dollar " + num_words(c)  # $1.50 -> a dollar fifty
+    if d == 1:
+        return "a dollar " + num_words(c) if c else "a dollar"  # $1.50 -> a dollar fifty
     dollars = f"{num_words(d)} dollar{'' if d == 1 else 's'}"
     return f"{dollars} {num_words(c)}" if c else dollars
 
