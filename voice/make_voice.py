@@ -354,13 +354,15 @@ def render(items, voice, gap, duration=None):
     for n, (s, e, text) in enumerate(items):
         if timed:
             nxt = items[n + 1][0] if n + 1 < len(items) else None
-            if nxt is not None:
-                slot = max(nxt - s - gap, e - s)
+            if nxt is not None:  # end a small gap before the next line starts
+                slot = max(nxt - s - gap, 0.5)
             elif duration:  # last line must finish before the video ends
                 slot = duration - s - 0.1
             else:
                 slot = max(e - s, 0.1) + 1.5
             start = max(s, cursor)
+            # if the previous line ran long we start late: the line must still end on time
+            slot = max(0.5, slot - (start - s))
         else:
             slot, start = None, cursor
         line = join_sentences(parts[n], sents[n], pause)
