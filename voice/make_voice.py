@@ -58,7 +58,8 @@ def group_sentences(cues):
     groups, cur = [], []
     for c in cues:
         cur.append(c)
-        if c[0] is None or re.search(r"[.!?…]['\")\]]*$", c[2]):
+        # a cue that is already a full sentence or longer stays on its own timing
+        if c[0] is None or re.search(r"[.!?…]['\")\]’”]*$", c[2]) or len(c[2].split()) >= 12:
             groups.append(cur)
             cur = []
     if cur:
@@ -101,8 +102,15 @@ def normalize_for_tts(text):
     """Spell out money/numbers and drop symbols the TTS would stumble on."""
     t = text.replace("’", "'").replace("‘", "'")
     t = re.sub(r"\$(\d[\d,]*)(?:\.(\d\d))?\b", _money, t)
+    t = re.sub(r"\b(\d[\d,]*)\s?%", lambda m: m.group(1) + " percent", t)
+    t = re.sub(r"\b\d{1,3}(?:,\d{3})+\b", lambda m: m.group().replace(",", ""), t)  # 20,000 -> 20000
     t = re.sub(r"\b\d{1,6}\b", lambda m: num_words(m.group()), t)
     t = re.sub(r"[\"“”]", "", t)
+    # single quotes used as dialogue marks (keep apostrophes inside words: I'll, it's)
+    t = re.sub(r"(^|[\s(])'(?=\w)", r"\1", t)
+    t = re.sub(r"(?<=[.!?,;:])'", "", t)
+    t = t.replace("—", ", ").replace("–", ", ")
+    t = re.sub(r"(?<!\.)\.\.(?!\.)", "...", t)
     t = t.replace("~", "!").replace("…", "...")
     t = re.sub(r"\b[A-Z]{2,}\b", lambda m: m.group() if m.group() in ("OK", "ID", "VIP") else m.group().lower(), t)
     t = re.sub(r"\s+", " ", t).strip()
