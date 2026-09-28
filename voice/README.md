@@ -55,6 +55,7 @@ python3 make_voice.py --text "Wait, did he just say yes?"             # 빠른 �
 - 잘게 쪼개진 자막은 문장 부호(. ! ?) 기준으로 합쳐 문장 단위로 만듭니다. 그래서 억양이 자연스럽습니다. 자막 한 줄씩 따로 읽히려면 `--no-group`을 붙이세요.
   "Huh?"처럼 아주 짧은 문장은 다음 문장에 붙여서 만듭니다.
 - `$1.50` → "a dollar fifty", `3` → "three", `~` → `!`, `ALWAYS` → "always"처럼 숫자와 기호는 읽기 좋게 바꿔서 합성합니다.
+- 베트남어처럼 영어 엔진이 못 읽는 단어는 `lexicon.json`에 발음 표기를 넣습니다(예: `"Không sao": "Kohm sao"`). 목록에 없는 단어는 성조 표시만 떼고 읽습니다(Việt → Viet).
 - `--video`를 주면 영상과 길이가 정확히 같은 파일이 세 가지 나옵니다.
   - `*_voice.wav/mp3`: 목소리만
   - `*_voice+bgm.wav/mp3`: 영상의 원래 오디오(배경음악)와 목소리를 섞은 것

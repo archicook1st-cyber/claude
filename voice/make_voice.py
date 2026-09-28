@@ -10,7 +10,7 @@ Both then get a pitch/formant move (Praat) and optional match-EQ.
   python3 make_voice.py subs.srt --video short.mp4     # -> out/subs_voice.*, subs_voice+bgm.*, subs_preview.mp4
   python3 make_voice.py --text "Wait, did he just say yes?"   # quick preview
 """
-import argparse, hashlib, json, os, re, subprocess, sys, tempfile
+import argparse, hashlib, json, os, re, subprocess, sys, tempfile, unicodedata
 import numpy as np, soundfile as sf, parselmouth
 from parselmouth.praat import call
 
@@ -98,9 +98,28 @@ def _money(m):
     return f"{dollars} {num_words(c)}" if c else dollars
 
 
+def load_lexicon(path=os.path.join(HERE, "lexicon.json")):
+    """Pronunciation respellings for words the English TTS can't read (e.g. Vietnamese)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lex = json.load(f)
+    except FileNotFoundError:
+        return []
+    # longest first so a phrase wins over a word inside it
+    return sorted(((k, v) for k, v in lex.items() if not k.startswith("_")), key=lambda kv: -len(kv[0]))
+
+
+LEXICON = load_lexicon()
+
+
 def normalize_for_tts(text):
     """Spell out money/numbers and drop symbols the TTS would stumble on."""
     t = text.replace("’", "'").replace("‘", "'")
+    for word, say in LEXICON:
+        t = re.sub(r"(?<!\w)" + re.escape(word) + r"(?!\w)", say, t, flags=re.IGNORECASE)
+    # anything still carrying diacritics: fall back to plain letters (Việt -> Viet)
+    t = "".join(c for c in unicodedata.normalize("NFKD", t.replace("đ", "d").replace("Đ", "D"))
+                if not unicodedata.combining(c))
     t = re.sub(r"\$(\d[\d,]*)(?:\.(\d\d))?\b", _money, t)
     t = re.sub(r"\b(\d[\d,]*)\s?%", lambda m: m.group(1) + " percent", t)
     t = re.sub(r"\b\d{1,3}(?:,\d{3})+\b", lambda m: m.group().replace(",", ""), t)  # 20,000 -> 20000
