@@ -47,13 +47,17 @@ def trim_tail(path, text, asr):
     return " ".join(w.word.strip() for w in ws[:idx + 1])
 
 
-def wer(ref, hyp):
+def wer(ref, hyp, ignore=()):
+    """Word error. Respelled foreign words (lexicon) can't be checked by an English
+    ASR, so they are skipped and only missing words count on those lines."""
     r, h = words(ref), words(hyp)
+    skip = set(ignore) & set(r)
+    r = [x for x in r if x not in skip]
     if not r:
         return 0.0
     sm = difflib.SequenceMatcher(a=r, b=h, autojunk=False)
     matched = sum(b.size for b in sm.get_matching_blocks())
-    return 1 - matched / max(len(r), len(h))
+    return 1 - matched / (len(r) if skip else max(len(r), len(h)))
 
 
 def main():
@@ -76,7 +80,7 @@ def main():
             path = os.path.join(job["out_dir"], f"{it['id']}_try{attempt}.wav")
             torchaudio.save(path, wav, model.sr)
             heard = trim_tail(path, it["text"], asr)
-            err = wer(it["text"], heard)
+            err = wer(it["text"], heard, job.get("ignore_words", ()))
             print(f"[{it['id']}] try {attempt}: {wav.shape[-1] / model.sr:.1f}s in {time.time() - t:.0f}s, "
                   f"WER {err:.2f} | {heard}", flush=True)
             if best is None or err < best[0]:
@@ -84,13 +88,13 @@ def main():
             if err <= job.get("max_wer", 0.1):
                 break
         final = os.path.join(job["out_dir"], f"{it['id']}.wav")
-        os.replace(best[1], final)
+        os.replace(best[1], final)  # visible to the cache immediately
         results.append({"id": it["id"], "text": it["text"], "heard": best[2], "wer": round(best[0], 3),
                         "path": final, "sr": model.sr})
         for f in os.listdir(job["out_dir"]):
             if f.startswith(f"{it['id']}_try"):
                 os.remove(os.path.join(job["out_dir"], f))
-    json.dump(results, open(os.path.join(job["out_dir"], "results.json"), "w"), indent=2)
+    json.dump(results, open(job.get("results", os.path.join(job["out_dir"], "results.json")), "w"), indent=2)
 
 
 if __name__ == "__main__":

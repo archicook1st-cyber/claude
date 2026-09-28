@@ -272,19 +272,21 @@ class CloneVoice:
         todo = {k: t for k, t in zip(keys, texts) if not os.path.exists(os.path.join(cache, k + ".wav"))}
         print(f"{len(texts) - len(todo)} of {len(texts)} lines cached, generating {len(todo)}", flush=True)
         if todo:
+            ignore = sorted({w.lower() for _, say in LEXICON for w in re.findall(r"[A-Za-z']+", say)})
             with tempfile.TemporaryDirectory() as d:
+                # the worker writes finished lines straight into the cache, so progress survives a stop
                 job = {"ref": os.path.join(HERE, p["ref_audio"]), "exaggeration": p["exaggeration"],
                        "cfg_weight": p["cfg_weight"], "seed": p.get("seed", 7),
-                       "max_tries": p.get("max_tries", 3), "max_wer": p.get("max_wer", 0.1), "out_dir": d,
+                       "max_tries": p.get("max_tries", 3), "max_wer": p.get("max_wer", 0.1),
+                       "out_dir": cache, "results": os.path.join(d, "results.json"), "ignore_words": ignore,
                        "items": [{"id": k, "text": t} for k, t in todo.items()]}
                 jp = os.path.join(d, "job.json")
                 with open(jp, "w") as f:
                     json.dump(job, f)
                 subprocess.run([self.python, os.path.join(HERE, "cb_worker.py"), jp], check=True)
-                for r in json.load(open(os.path.join(d, "results.json"))):
+                for r in json.load(open(job["results"])):
                     if r["wer"] > p.get("max_wer", 0.1):
                         print(f"  ! still differs after retries: {r['text']!r} -> heard {r['heard']!r}", flush=True)
-                    os.replace(r["path"], os.path.join(cache, r["id"] + ".wav"))
         out = []
         for k in keys:
             a, sr = sf.read(os.path.join(cache, k + ".wav"), dtype="float32")
