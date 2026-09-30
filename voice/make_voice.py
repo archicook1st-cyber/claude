@@ -112,6 +112,25 @@ def load_lexicon(path=os.path.join(HERE, "lexicon.json")):
 LEXICON = load_lexicon()
 
 
+def strip_quote_marks(t):
+    """Drop single quotes used as quotation marks, pairing an opening quote (after a
+    space, before a letter) with the next quote not followed by a letter. Apostrophes
+    inside words (I'll, it's, Minh's) stay."""
+    out, inside = [], False
+    for i, c in enumerate(t):
+        if c == "'":
+            prev = t[i - 1] if i else " "
+            nxt = t[i + 1] if i + 1 < len(t) else " "
+            if not inside and (prev.isspace() or prev in "(-") and nxt.isalpha():
+                inside = True
+                continue
+            if inside and not nxt.isalpha():
+                inside = False
+                continue
+        out.append(c)
+    return "".join(out)
+
+
 def normalize_for_tts(text):
     """Spell out money/numbers and drop symbols the TTS would stumble on."""
     t = text.replace("’", "'").replace("‘", "'")
@@ -124,10 +143,9 @@ def normalize_for_tts(text):
     t = re.sub(r"\b(\d[\d,]*)\s?%", lambda m: m.group(1) + " percent", t)
     t = re.sub(r"\b\d{1,3}(?:,\d{3})+\b", lambda m: m.group().replace(",", ""), t)  # 20,000 -> 20000
     t = re.sub(r"\b\d{1,6}\b", lambda m: num_words(m.group()), t)
+    t = re.sub(r"\b([A-Z][\w-]*)\s?\(([A-Za-z]+)\)", lambda m: f"{m.group(1)} in {m.group(2).capitalize()}", t)  # Busan(korea)
     t = re.sub(r"[\"“”]", "", t)
-    # single quotes used as dialogue marks (keep apostrophes inside words: I'll, it's)
-    t = re.sub(r"(^|[\s(])'(?=\w)", r"\1", t)
-    t = re.sub(r"(?<=[.!?,;:])'", "", t)
+    t = strip_quote_marks(t)
     t = t.replace("—", ", ").replace("–", ", ")
     t = re.sub(r"(?<!\.)\.\.(?!\.)", "...", t)
     t = t.replace("~", "!").replace("…", "...")
@@ -135,6 +153,8 @@ def normalize_for_tts(text):
     t = re.sub(r"\s+", " ", t).strip()
     # capitalize after . ! ? (but not after "..." which reads as a trailing-off continuation)
     t = re.sub(r"(?<!\.)([.!?])(\s+)([a-z])", lambda m: m.group(1) + m.group(2) + m.group(3).upper(), t)
+    if t and t[-1] not in ".!?":  # a cue without end punctuation still ends like a sentence
+        t += "."
     return t[:1].upper() + t[1:]
 
 
